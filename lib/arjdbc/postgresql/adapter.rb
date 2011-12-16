@@ -1,3 +1,4 @@
+require 'benchmark'
 module ActiveRecord::ConnectionAdapters
   PostgreSQLAdapter = Class.new(AbstractAdapter) unless const_defined?(:PostgreSQLAdapter)
 end
@@ -283,8 +284,79 @@ module ::ArJdbc
       end
       id_value
     end
+    
+     # Returns the list of a table's column names, data types, and default values.
+      #
+      # The underlying query is roughly:
+      #  SELECT column.name, column.type, default.value
+      #    FROM column LEFT JOIN default
+      #      ON column.table_id = default.table_id
+      #     AND column.num = default.column_num
+      #   WHERE column.table_id = get_table_id('table_name')
+      #     AND column.num > 0
+      #     AND NOT column.is_dropped
+      #   ORDER BY column.num
+      #
+      # If the table name is not prefixed with a schema, the database will
+      # take the first match from the schema search path.
+      #
+      # Query implementation notes:
+      #  - format_type includes the column size constraint, e.g. varchar(50)
+      #  - ::regclass is a function that gives the id for a table name
+      def column_definitions(table_name) #:nodoc:
+        query <<-end_sql
+          SELECT a.attname, format_type(a.atttypid, a.atttypmod), d.adsrc, a.attnotnull
+            FROM pg_attribute a LEFT JOIN pg_attrdef d
+              ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+           WHERE a.attrelid = '#{quote_table_name(table_name)}'::regclass
+             AND a.attnum > 0 AND NOT a.attisdropped
+           ORDER BY a.attnum
+        end_sql
+      end
+      
+      def extract_pg_identifier_from_name(name)
+        match_data = name[0,1] == '"' ? name.match(/\"([^\"]+)\"/) : name.match(/([^\.]+)/)
+
+        if match_data
+          rest = name[match_data[0].length..-1]
+          rest = rest[1..-1] if rest[0,1] == "."
+          [match_data[1], (rest.length > 0 ? rest : nil)]
+        end
+      end
+      
+       def quote_table_name(name)
+          schema, name_part = extract_pg_identifier_from_name(name.to_s)
+          unless name_part
+            "\"#{schema}\""
+          else
+            table_name, name_part = extract_pg_identifier_from_name(name_part)
+            "\"#{schema}\".\"#{table_name}\""
+          end
+        end
+        
+      def query(sql, name = nil) #:nodoc:
+          return @connection.execute(sql).collect{|res| res.values}
+      end
 
     def pg_columns(table_name, name=nil)
+      ret=nil
+      Benchmark.bm do |x|
+        x.report do
+          ret = pg_columns_inner(table_name, name)
+    #      p "WUT? #{ret.class.name} #{ret.to_s}"
+          
+        end
+      end
+      ret
+    end
+        
+    def pg_columns_inner3(table_name, name=nil)
+      column_definitions(table_name).collect do |name, type, default, notnull|
+        ActiveRecord::ConnectionAdapters::PostgreSQLColumn.new(name, type, default, notnull == 'f')
+      end
+    end
+
+    def pg_columns_inner(table_name, name=nil)
       schema_name = @config[:schema_search_path]
       if table_name =~ /\./
         parts = table_name.split(/\./)
@@ -634,6 +706,101 @@ module ActiveRecord::ConnectionAdapters
     end
   end
 
+  class PostgresJdbcConnection < JdbcConnection
+    alias :java_native_database_types :set_native_database_types
+
+    NATIVE_DATABASE_TYPES = {
+       :bool=>{:name=>"bool"},
+       :bytea=>{:name=>"bytea"},
+       :char=>{:name=>"char"},
+       :int8=>{:name=>"int8"},
+       :bigserial=>{:name=>"bigserial"},
+       :int2=>{:name=>"int2"},
+       :int4=>{:name=>"int4"},
+       :serial=>{:name=>"serial"},
+       :regproc=>{:name=>"regproc"},
+       :text=>{:name=>"text"},
+       :oid=>{:name=>"oid"},
+       :tid=>{:name=>"tid"},
+       :xid=>{:name=>"xid"},
+       :cid=>{:name=>"cid"},
+       :xml=>{:name=>"xml"},
+       :smgr=>{:name=>"smgr"},
+       :path=>{:name=>"path"},
+       :polygon=>{:name=>"polygon"},
+       :float4=>{:name=>"float4"},
+       :float8=>{:name=>"float8"},
+       :abstime=>{:name=>"abstime"},
+       :reltime=>{:name=>"reltime"},
+       :tinterval=>{:name=>"tinterval"},
+       :unknown=>{:name=>"unknown"},
+       :circle=>{:name=>"circle"},
+       :money=>{:name=>"money"},
+       :macaddr=>{:name=>"macaddr"},
+       :inet=>{:name=>"inet"},
+       :cidr=>{:name=>"cidr"},
+       :aclitem=>{:name=>"aclitem"},
+       :bpchar=>{:name=>"bpchar", :limit=>10485760},
+       :varchar=>{:name=>"varchar", :limit=>10485760},
+       :date=>{:name=>"date"},
+       :time=>{:name=>"time"},
+       :timestamp=>{:name=>"timestamp"},
+       :timestamptz=>{:name=>"timestamptz", :limit=>6},
+       :interval=>{:name=>"interval", :limit=>6},
+       :timetz=>{:name=>"timetz", :limit=>6},
+       :bit=>{:name=>"bit", :limit=>83886080},
+       :varbit=>{:name=>"varbit", :limit=>83886080},
+       :numeric=>{:name=>"numeric", :limit=>1000},
+       :refcursor=>{:name=>"refcursor"},
+       :regprocedure=>{:name=>"regprocedure"},
+       :regoper=>{:name=>"regoper"},
+       :regoperator=>{:name=>"regoperator"},
+       :regclass=>{:name=>"regclass"},
+       :regtype=>{:name=>"regtype"},
+       :uuid=>{:name=>"uuid"},
+       :tsvector=>{:name=>"tsvector"},
+       :gtsvector=>{:name=>"gtsvector"},
+       :tsquery=>{:name=>"tsquery"},
+       :regconfig=>{:name=>"regconfig"},
+       :regdictionary=>{:name=>"regdictionary"},
+       :txid_snapshot=>{:name=>"txid_snapshot"},
+       :record=>{:name=>"record"},
+       :cstring=>{:name=>"cstring"},
+       :any=>{:name=>"any"},
+       :anyarray=>{:name=>"anyarray"},
+       :void=>{:name=>"void"},
+       :trigger=>{:name=>"trigger"},
+       :language_handler=>{:name=>"language_handler"},
+       :internal=>{:name=>"internal"},
+       :opaque=>{:name=>"opaque"},
+       :anyelement=>{:name=>"anyelement"},
+       :anynonarray=>{:name=>"anynonarray"},
+       :anyenum=>{:name=>"anyenum"},
+       :cardinal_number=>{:name=>"cardinal_number"},
+       :character_data=>{:name=>"character_data"},
+       :sql_identifier=>{:name=>"sql_identifier"},
+       :time_stamp=>{:name=>"time_stamp"},
+       :chkpass=>{:name=>"chkpass"},
+       :ghstore=>{:name=>"ghstore"},
+       :hstore=>{:name=>"hstore"},
+       :intbig_gkey=>{:name=>"intbig_gkey"},
+       :query_int=>{:name=>"query_int"},
+       :lo=>{:name=>"lo"},
+       :email=>{:name=>"email"},
+       :string=>{:name=>"varchar", :limit=>10485760},
+       :integer=>{:name=>"int4"},
+       :decimal=>{:name=>"numeric", :limit=>1000},
+       :float=>{:name=>"float4"},
+       :datetime=>{:name=>"timestamp"},
+       :binary=>{:name=>"bytea"},
+       :boolean=>{:name=>"boolean", :limit=>1}
+    }
+    
+   # def set_native_database_types
+    #  @native_types = NATIVE_DATABASE_TYPES
+    #end
+  end
+  
   class PostgreSQLAdapter < JdbcAdapter
     include ArJdbc::PostgreSQL
 
